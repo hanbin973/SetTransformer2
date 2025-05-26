@@ -8,219 +8,214 @@ from typing import Any, Callable, Sequence, Optional, Union
 from jax import Array
 from jax.typing import ArrayLike
 
-from .attention import euclidean_attention
+from .config import ModuleConfig
+from .normalization import Norm
 
+# Embedding
 class HiddenPadding(nn.Module):
-    num_hidden: int
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
             self,
             x: ArrayLike,
-            mask: ArrayLike = None,
+            mask: Optional[ArrayLike] = None,
             ) -> Array:
+
         num_batches, num_samples, num_orig = x.shape
-        padding = jnp.zeros((num_batches, num_samples, self.num_hidden - num_orig))
-        return jnp.concatenate((x , padding), axis=-1), mask
+        num_hidden = self.config.num_hidden
+        padding = jnp.zeros((num_batches, num_samples, num_hidden - num_orig))
         
-class Embedding(nn.Module):
-    num_hidden: int
-    
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike = None,
-            ) -> Array:
-        return nn.Dense(self.num_hidden)(x), mask
-
-class MAB2(nn.Module):
-    num_hidden: int
-    num_attn_heads: int
-    layer_norm: bool = False
+        return jnp.concatenate((x , padding), axis=-1)
+        
+# SetTransformer modules
+class MAB(nn.Module):
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
             self,
             x: ArrayLike,
             y: ArrayLike,
-            mask: ArrayLike = None,
+            mask: Optional[ArrayLike] = None,
             ) -> Array:
 
         num_batches, num_tokens = x.shape[0], x.shape[1]
+        num_hidden, num_attn_heads = self.config.num_hidden, self.config.num_attn_heads 
+        attn_fn, act_fn, norm_type = self.config.attn_fn, self.config.act_fn, self.config.norm_type
+        eps_norm, use_bias = self.config.eps_norm, self.config.use_bias
+        ln_attn, ln_ffn = self.config.ln_attn, self.config.ln_ffn
 
         # attention 
-        attn_head_dim = self.num_hidden // self.num_attn_heads
+        attn_head_dim = num_hidden // num_attn_heads
+        q = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(x)
+        k = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(y)
+        v = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(y)
 
-        q = nn.DenseGeneral(features = (self.num_attn_heads, attn_head_dim))(x)
-        k = nn.DenseGeneral(features = (self.num_attn_heads, attn_head_dim))(y)
-        v = nn.DenseGeneral(features = (self.num_attn_heads, attn_head_dim))(y)
-
-        if self.layer_norm:
-            attn = nn.dot_product_attention(nn.LayerNorm()(q), nn.LayerNorm()(k), v, mask=mask)
-        else:
-            attn = nn.dot_product_attention(q, nn.LayerNorm()(k), v, mask=mask)
-        h = x + attn.reshape(num_batches, num_tokens, self.num_hidden)
+        attn = attn_fn(q, k ,v, mask=mask[:, None, None, :])
+        h = x + attn.reshape(num_batches, num_tokens, num_hidden)
+        h = Norm(norm_type, epsilon=eps_norm, use_bias=False, use_scale=False)(h) if ln_attn else h
 
         # feed-forward
-        h = h + nn.relu(nn.Dense(self.num_hidden)(nn.LayerNorm()(h)))
+        h = h + act_fn(nn.Dense(num_hidden, use_bias=use_bias)(h))
+        h = Norm(norm_type, epsilon=eps_norm, use_bias=False, use_scale=False)(h) if ln_ffn else h
 
         return h
 
+class MAB2(nn.Module):
+    config: ModuleConfig
+
+    @nn.compact
+    def __call__(
+            self,
+            x: ArrayLike,
+            y: ArrayLike,
+            mask: Optional[ArrayLike] = None,
+            ) -> Array:
+        
+        num_batches, num_tokens = x.shape[0], x.shape[1]
+        num_hidden, num_attn_heads = self.config.num_hidden, self.config.num_attn_heads 
+        attn_fn, act_fn, norm_type= self.config.attn_fn, self.config.act_fn, self.config.norm_type
+        eps_norm, use_bias = self.config.eps_norm, self.config.use_bias
+        ln_query, ln_key, ln_ffn = self.config.ln_query, self.config.ln_key, self.config.ln_ffn
+
+        # normalization
+        q = Norm(norm_type, epsilon=eps_norm, use_bias=False, use_scale=False)(x, mask) if ln_query else x
+        k = Norm(norm_type, epsilon=eps_norm, use_bias=False, use_scale=False)(y, mask) if ln_key else y
+
+        # attention 
+        attn_head_dim = num_hidden // num_attn_heads
+        q = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(q) 
+        k = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(k)
+        v = nn.DenseGeneral(features = (num_attn_heads, attn_head_dim), use_bias=use_bias)(y)
+
+        attn = attn_fn(q, k ,v, mask=mask[:, None, None, :])
+        h = x + attn.reshape(num_batches, num_tokens, num_hidden)
+
+        # feed-forward
+        r = Norm(norm_type, epsilon=eps_norm, use_bias=False, use_scale=False)(h, mask) if ln_ffn else h
+        h = h + act_fn(nn.Dense(num_hidden, use_bias=use_bias)(r))
+
+        return h
+
+class SAB(nn.Module):
+    config: ModuleConfig
+
+    @nn.compact
+    def __call__(
+            self,
+            x: ArrayLike,
+            mask: Optional[ArrayLike] = None,
+            ) -> Array:
+
+        return MAB(self.config)(x, x, mask)    
+
 class SAB2(nn.Module):
-    num_hidden: int
-    num_attn_heads: int
-    layer_norm: bool = False
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
             self,
             x: ArrayLike,
-            mask: ArrayLike = None,
+            mask: Optional[ArrayLike] = None,
             ) -> Array:
-        return MAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(x, x, mask)    
 
-class ISAB2(nn.Module):
-    num_hidden: int
-    num_attn_heads: int
-    num_induced: int
-    layer_norm: bool = False
+        return MAB2(self.config)(x, x, mask)    
+
+class ISAB(nn.Module):
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
             self,
             x: ArrayLike,
-            mask: ArrayLike = None,
+            mask: Optional[ArrayLike] = None,
+            scale: Optional[ArrayLike] = None,
             ) -> Array:
+
+        num_hidden, num_induced = self.config.num_hidden, self.config.num_induced  
         num_batches = x.shape[0]
 
-        i = self.param("induced_points", nn.initializers.xavier_uniform(), (1, self.num_induced, self.num_hidden))
-        i = jnp.repeat(i, num_batches, axis=0).reshape(num_batches, self.num_induced, self.num_hidden)
+        i = self.param("induced_points", nn.initializers.xavier_uniform(), (1, num_induced, num_hidden))
+        i = jnp.repeat(i, num_batches, axis=0).reshape(num_batches, num_induced, num_hidden)
+        if scale is not None:
+            i *= scale[:, None, None]
 
-        h = MAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(i, x, mask=mask)
-        h = MAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(x, h)
+        h = MAB(self.config)(i, x, mask=mask)
+        h = MAB(self.config)(x, h)
+        return h
+
+class ISAB2(nn.Module):
+    config1: ModuleConfig
+    config2: ModuleConfig
+
+    @nn.compact
+    def __call__(
+            self,
+            x: ArrayLike,
+            mask: Optional[ArrayLike] = None,
+            scale: Optional[ArrayLike] = None,
+            ) -> Array:
+
+        num_batches = x.shape[0]
+        num_hidden, num_induced = self.config.num_hidden, self.config.num_induced  
+
+        i = self.param("induced_points", nn.initializers.xavier_uniform(), (1, num_induced, num_hidden))
+        i = jnp.repeat(i, num_batches, axis=0).reshape(num_batches, num_induced, num_hidden)
+        if scale is not None:
+            i *= scale[:, None, None]
+
+        h = MAB2(self.config1)(i, x, mask=mask)
+        h = MAB2(self.config2)(x, h)
         return h
         
 class PMA(nn.Module):
-    num_hidden: int
-    num_attn_heads: int
-    num_seeds: int
-    layer_norm: bool = False
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
             self,
             x: ArrayLike,
-            mask: ArrayLike = None,
+            mask: Optional[ArrayLike] = None,
+            scale: Optional[ArrayLike] = None,
             ) -> Array:
-        num_batches = x.shape[0]
-
-        s = self.param("seeds", nn.initializers.xavier_uniform(), (1, self.num_seeds, self.num_hidden))
-        s = jnp.repeat(s, num_batches, axis=0).reshape(num_batches, self.num_seeds, self.num_hidden)
-
-        x = MAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(s, x, mask=mask)
-        return x
-
-class SetEncoder2(nn.Module):
-    num_layers: int
-    num_hidden: int
-    num_attn_heads: int
-    layer_norm: bool = False
-
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike = None,
-            ) -> Array:
-        for _ in range(self.num_layers):
-            x = SAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(x, mask=mask)
-        return x
-
-class InducedSetEncoder2(nn.Module):
-    num_layers: int
-    num_hidden: int
-    num_attn_heads: int
-    num_induced: int
-    layer_norm: bool = False
-
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike = None,
-            ) -> Array:
-        for _ in range(self.num_layers):
-            x = ISAB2(self.num_hidden, self.num_attn_heads, self.num_induced, self.layer_norm)(x, mask=mask)
-        return x
-
-class SetAggregator(nn.Module):
-    num_layers: int
-    num_hidden: int
-    num_attn_heads: int
-    num_seeds: int
-    layer_norm: bool = False
-
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike,
-            ) -> Array:
-        x = PMA(self.num_hidden, self.num_attn_heads, self.num_seeds, self.layer_norm)(x, mask)
-        for _ in range(self.num_layers):
-            x = SAB2(self.num_hidden, self.num_attn_heads, self.layer_norm)(x)
-        return x
-
-class SetTransformer2(nn.Module):
-    num_layers: int
-    num_hidden: int
-    num_attn_heads: int
-    num_agg_layers: int
-    num_seeds: int
-    layer_norm: bool = False
-
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike = None,
-            ) -> Array:
-        x = SetEncoder2(self.num_layers, self.num_hidden, self.num_attn_heads, self.layer_norm)(x, mask)
-        x = SetAggregator(self.num_agg_layers, self.num_hidden, self.num_attn_heads, self.num_seeds, self.layer_norm)(x, mask)
-        return x
-
-class InducedSetTransformer2(nn.Module):
-    num_layers: int
-    num_hidden: int
-    num_attn_heads: int
-    num_induced: int
-    num_agg_layers: int
-    num_seeds: int
-    layer_norm: bool = False
-
-    @nn.compact
-    def __call__(
-            self,
-            x: ArrayLike,
-            mask: ArrayLike = None,
-            ) -> Array:
-        x = InducedSetEncoder2(self.num_layers, self.num_hidden, self.num_attn_heads, self.num_induced, self.layer_norm)(x, mask)
-        x = SetAggregator(self.num_agg_layers, self.num_hidden, self.num_attn_heads, self.num_seeds, self.layer_norm)(x, mask)
-        return x
         
-class LinearEstimator(nn.Module):
-    num_seeds: int
+        num_batches = x.shape[0]
+        num_hidden, num_seeds = self.config.num_hidden, self.config.num_seeds
+        use_scale = self.config.use_scale
+
+        s = self.param("seeds", nn.initializers.xavier_uniform(), (1, num_seeds, num_hidden))
+        s = jnp.repeat(s, num_batches, axis=0).reshape(num_batches, num_seeds, num_hidden)
+        if scale is not None:
+            s *= scale[:, None, None]
+
+        x = MAB(self.config)(s, x, mask=mask)
+        return x
+
+class PMA2(nn.Module):
+    config: ModuleConfig
 
     @nn.compact
     def __call__(
-        self,
-        x: ArrayLike
-        ) -> Array:
-        num_samples = x.shape[1]
-        s = self.param("seeds", nn.initializers.xavier_uniform(), (num_samples, self.num_seeds))
-        return jnp.einsum("np,bnj->bpj", s, x)
+            self,
+            x: ArrayLike,
+            mask: Optional[ArrayLike] = None,
+            scale: Optional[ArrayLike] = None,
+            ) -> Array:
+        
+        num_batches = x.shape[0]
+        num_hidden, num_seeds = self.config.num_hidden, self.config.num_seeds
+        use_scale = self.config.use_scale
 
+        s = self.param("seeds", nn.initializers.xavier_uniform(), (1, num_seeds, num_hidden))
+        s = jnp.repeat(s, num_batches, axis=0).reshape(num_batches, num_seeds, num_hidden)
+        if scale is not None:
+            s *= scale[:, None, None]
+
+        x = MAB2(self.config)(s, x, mask=mask)
+        return x
+       
+# Test functions
 if __name__ == "__main__":
     num_layers, num_agg_layers = 3, 2
     num_batches, num_tokens, num_hidden, num_attn_heads = 100, 1000, 256, 8
